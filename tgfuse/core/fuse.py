@@ -38,7 +38,7 @@ UNMANAGED_DIRECTORY_NAME = b"unmanaged"
 class TelegramFS(pyfuse3.Operations):
     _REMOTE_CHUNK_SIZE = 1024 * 1024
     _STREAM_BUFFER_LIMIT = 64 * 1024 * 1024
-    _PREFETCH_CHUNKS = 0
+    _PREFETCH_CHUNKS = 4
     _REMOTE_READ_TIMEOUT = 30
     _REMOTE_READ_RETRIES = 3
 
@@ -92,6 +92,7 @@ class TelegramFS(pyfuse3.Operations):
         self._stream_inflight: dict[tuple[str, int], asyncio.Task] = {}
         self._prefetch_tasks: dict[str, asyncio.Task] = {}
         self._prefetch_ranges: dict[str, tuple[int, int]] = {}
+        self._media_cache: dict[int, object] = {}
 
     async def _gather_all_docs(self):
         docs = []
@@ -109,7 +110,7 @@ class TelegramFS(pyfuse3.Operations):
         current_id = max([d[0] for d in docs]) + 1 if docs else 1
         
         batch_size = 200
-        max_empty_batches = 5 
+        max_empty_batches = 25
         empty_batches = 0
         new_files_found = 0
         allowed_extensions = ['.m4a', '.flac']
@@ -154,7 +155,7 @@ class TelegramFS(pyfuse3.Operations):
                     new_files_found += 1
 
             current_id += batch_size
-            await asyncio.sleep(1.0) 
+            await asyncio.sleep(0.5)
 
         if new_files_found > 0:
             try:
@@ -167,7 +168,6 @@ class TelegramFS(pyfuse3.Operations):
         return docs
     
     def parse_message_to_doc(self, msg):
-        import os
         allowed_extensions = ['.m4a', '.flac']
         
         if not msg.document:
@@ -189,12 +189,9 @@ class TelegramFS(pyfuse3.Operations):
         return (msg.id, str(msg.document.id), file_name.encode("utf-8"), size, ts, metadata)
 
     async def init_fs(self):
-        """Gather initial docs, then start periodic sync."""
         await self._sync_initial_docs()
-        # self._sync_task = asyncio.create_task(self._periodic_sync_task())
 
     async def destroy(self):
-        """Called on unmount => stop background tasks and best-effort flush dirty files."""
         pending_upload_inodes = set()
         if self._sync_task:
             self._sync_task.cancel()
@@ -239,6 +236,7 @@ class TelegramFS(pyfuse3.Operations):
         self._stream_inflight.clear()
         self._stream_buffer.clear()
         self._stream_buffer_bytes = 0
+        self._media_cache.clear()
 
         for inode in list(self._files):
             info = self._files.get(inode)
@@ -468,7 +466,6 @@ class TelegramFS(pyfuse3.Operations):
         self._msg_id_to_inode[m_id] = inode
 
     async def _periodic_sync_task(self):
-        """Runs every 30s, checks for new/removed docs in the channel."""
         while True:
             try:
                 await asyncio.sleep(30)
@@ -501,7 +498,6 @@ class TelegramFS(pyfuse3.Operations):
         return (msg.id, str(msg.document.id), file_name.encode("utf-8"), msg.document.size, int(msg.date.timestamp()), metadata)
 
     async def _sync_channel_updates(self):
-        """Add new docs & remove missing docs from local state."""
         log.debug("Syncing channel updates...")
         docs = [self._normalize_remote_doc(doc) for doc in await self._gather_all_docs()]
         current_msgs = {}
@@ -694,7 +690,6 @@ class TelegramFS(pyfuse3.Operations):
         }
 
     def _unique_file_name(self, parent_inode: int, fname: bytes) -> bytes:
-        """If conflict, append _2, _3, etc."""
         base = fname
         idx = 2
         while (parent_inode, fname) in self._name_to_inode:
@@ -858,30 +853,29 @@ class TelegramFS(pyfuse3.Operations):
         return task
 
     async def _download_remote_chunk(self, msg_id: int, file_id: str, chunk_index: int) -> bytes:
-        chunk_file = os.path.join(self._cache_dir, f"{file_id}_chunk_{chunk_index}.bin")
-        if os.path.exists(chunk_file):
-            with open(chunk_file, 'rb') as f:
-                return f.read()
-
         async def read_chunk_once():
-            msg = await self._tg_client.get_messages(self._chat_id, ids=msg_id)
-            if not msg or not msg.media:
-                return b""
+            media = self._media_cache.get(msg_id)
+            if not media:
+                msg = await self._tg_client.get_messages(self._chat_id, ids=msg_id)
+                if not msg or not msg.media:
+                    return b""
+                media = msg.media
+                if len(self._media_cache) > 1000:
+                    self._media_cache.pop(next(iter(self._media_cache)))
+                self._media_cache[msg_id] = media
 
             offset = chunk_index * self._REMOTE_CHUNK_SIZE
             data = bytearray()
             async for chunk in self._tg_client.iter_download(
-                msg.media,
+                media,
                 offset=offset,
-                limit=self._REMOTE_CHUNK_SIZE
+                request_size=min(self._REMOTE_CHUNK_SIZE, 512 * 1024)
             ):
                 data.extend(chunk)
+                if len(data) >= self._REMOTE_CHUNK_SIZE:
+                    break
 
-            chunk_data = bytes(data)
-            if chunk_data:
-                with open(chunk_file, 'wb') as f:
-                    f.write(chunk_data)
-            return chunk_data
+            return bytes(data[:self._REMOTE_CHUNK_SIZE])
 
         return await self._retry_flood_wait(
             f"read msg_id={msg_id} chunk={chunk_index}",
@@ -993,8 +987,12 @@ class TelegramFS(pyfuse3.Operations):
                     self._REMOTE_READ_RETRIES,
                 )
             else:
-                if len(data) > 0 or expected_size == 0:
+                if data:
+                    self._schedule_prefetch(msg_id, file_id, end_chunk + 1, file_size)
                     return data
+                elif not data and expected_size > 0:
+                    return b""
+
                 last_error = None
                 self._drop_stream_buffer_range(file_id, start_chunk, end_chunk)
                 log.warning(
