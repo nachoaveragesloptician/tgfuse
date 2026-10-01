@@ -38,7 +38,7 @@ UNMANAGED_DIRECTORY_NAME = b"unmanaged"
 class TelegramFS(pyfuse3.Operations):
     _REMOTE_CHUNK_SIZE = 1024 * 1024
     _STREAM_BUFFER_LIMIT = 64 * 1024 * 1024
-    _PREFETCH_CHUNKS = 64
+    _PREFETCH_CHUNKS = 0
     _REMOTE_READ_TIMEOUT = 30
     _REMOTE_READ_RETRIES = 3
 
@@ -993,8 +993,7 @@ class TelegramFS(pyfuse3.Operations):
                     self._REMOTE_READ_RETRIES,
                 )
             else:
-                if len(data) == expected_size:
-                    self._schedule_prefetch(msg_id, file_id, end_chunk + 1, file_size)
+                if len(data) > 0 or expected_size == 0:
                     return data
                 last_error = None
                 self._drop_stream_buffer_range(file_id, start_chunk, end_chunk)
