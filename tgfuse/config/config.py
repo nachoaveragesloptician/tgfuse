@@ -1,13 +1,15 @@
 import os
+import tempfile
 
 class Config:
     log_level: str = "INFO"
-    tg_id: str = ''
+    tg_id: int = 0
     tg_hash: str = ''
     tg_token: str = ''
     chat_id: int = 0
     tg_upload_workers: int = 4
     tg_upload_buffer_parts: int = 16
+    cache_dir: str = os.path.join(tempfile.gettempdir(), "tgfuse_cache")
 
     @classmethod
     def load_from_env(cls):

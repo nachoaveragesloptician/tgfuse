@@ -7,17 +7,16 @@ import stat
 import tempfile
 import time
 import uuid
+import json
 from collections import OrderedDict
 from typing import Sequence, Tuple
 
 import pyfuse3
 import pyfuse3.asyncio
-from pyrogram.errors import RPCError
+from telethon.errors import RPCError
 from pyfuse3 import EntryAttributes, FileInfo, FUSEError, ROOT_INODE
 
 from tgfuse.config import logging_config
-from tgfuse.funcs.channel import gather_all_docs
-from tgfuse.funcs.download import RawDocumentDownloader
 from tgfuse.funcs.floodwait import sleep_for_flood_wait, retry_flood_wait
 from tgfuse.funcs.media import (
     DIRECTORY_MARKER_NAME,
@@ -26,10 +25,7 @@ from tgfuse.funcs.media import (
     build_directory_caption,
     build_file_caption,
     build_symlink_caption,
-    remote_entry_from_message,
-    remote_file_from_message,
 )
-from tgfuse.funcs.upload import send_document_from_path
 
 pyfuse3.asyncio.enable()
 
@@ -37,7 +33,6 @@ log = logging_config.setup_logging(__name__)
 
 BOT_DELETE_MAX_AGE = 48 * 60 * 60
 UNMANAGED_DIRECTORY_NAME = b"unmanaged"
-
 
 class TelegramFS(pyfuse3.Operations):
     _REMOTE_CHUNK_SIZE = 1024 * 1024
@@ -86,19 +81,97 @@ class TelegramFS(pyfuse3.Operations):
         self._next_fh = 1
 
         self._spool_dir = tempfile.mkdtemp(prefix="tgfuse-", dir=tempfile.gettempdir())
+        
+        self._cache_dir = os.path.join(tempfile.gettempdir(), "tgfuse_cache")
+        os.makedirs(self._cache_dir, exist_ok=True)
+
         self._inode_locks: dict[int, asyncio.Lock] = {}
         self._stream_buffer: OrderedDict[tuple[str, int], bytes] = OrderedDict()
         self._stream_buffer_bytes = 0
         self._stream_inflight: dict[tuple[str, int], asyncio.Task] = {}
         self._prefetch_tasks: dict[str, asyncio.Task] = {}
         self._prefetch_ranges: dict[str, tuple[int, int]] = {}
-        self._downloaders: OrderedDict[str, RawDocumentDownloader] = OrderedDict()
-        self._downloaders_limit = 8
+
+    async def _gather_all_docs(self):
+        docs = []
+        batch_size = 200
+        current_id = 1
+        max_empty_batches = 5 
+        empty_batches = 0
+
+        # Define allowed extensions (use lowercase)
+        allowed_extensions = ['.m4a', '.flac']
+
+        while True:
+            ids_to_fetch = list(range(current_id, current_id + batch_size))
+            messages = await self._tg_client.get_messages(self._chat_id, ids=ids_to_fetch)
+        
+            valid_messages = [msg for msg in messages if msg is not None]
+
+            if not valid_messages:
+                empty_batches += 1
+                if empty_batches >= max_empty_batches:
+                    break
+            else:
+                empty_batches = 0
+
+            for msg in valid_messages:
+                if msg.document:
+                    file_name = msg.file.name if msg.file and msg.file.name else f"unnamed_{msg.id}"
+                
+                    # Check if the file extension is in our allowed list
+                    ext = os.path.splitext(file_name)[1].lower()
+                    if ext not in allowed_extensions:
+                        continue
+                
+                    size = msg.document.size
+                    ts = int(msg.date.timestamp()) if msg.date else 0
+                    metadata = {
+                        "mime_type": msg.document.mime_type,
+                        "parent_id": msg.reply_to_msg_id,
+                        "date": msg.date.isoformat() if msg.date else None
+                    }
+                
+                    docs.append((
+                        msg.id, 
+                        str(msg.document.id), 
+                        file_name.encode("utf-8"), 
+                        size, 
+                        ts, 
+                        metadata
+                    ))
+
+            current_id += batch_size
+            await asyncio.sleep(1.0) 
+
+        return docs
+    
+    def parse_message_to_doc(self, msg):
+        import os
+        allowed_extensions = ['.m4a', '.flac']
+        
+        if not msg.document:
+            return None
+            
+        file_name = msg.file.name if msg.file and msg.file.name else f"unnamed_{msg.id}"
+        ext = os.path.splitext(file_name)[1].lower()
+        if ext not in allowed_extensions:
+            return None
+            
+        size = msg.document.size
+        ts = int(msg.date.timestamp()) if msg.date else 0
+        metadata = {
+            "mime_type": msg.document.mime_type,
+            "parent_id": msg.reply_to_msg_id,
+            "date": msg.date.isoformat() if msg.date else None
+        }
+        
+        return (msg.id, str(msg.document.id), file_name.encode("utf-8"), size, ts, metadata)
 
     async def init_fs(self):
         """Gather initial docs, then start periodic sync."""
         await self._sync_initial_docs()
-        self._sync_task = asyncio.create_task(self._periodic_sync_task())
+        # self._sync_task = asyncio.create_task(self._periodic_sync_task())
 
     async def destroy(self):
         """Called on unmount => stop background tasks and best-effort flush dirty files."""
@@ -159,19 +232,12 @@ class TelegramFS(pyfuse3.Operations):
                 with contextlib.suppress(Exception):
                     await self._commit_inode(inode)
 
-        for downloader in list(self._downloaders.values()):
-            with contextlib.suppress(Exception):
-                await downloader.close()
-        self._downloaders.clear()
-
         shutil.rmtree(self._spool_dir, ignore_errors=True)
         log.info("destroy() done - FS unmounted.")
 
     async def _sync_initial_docs(self):
         log.info("Initial sync: gather existing docs from channel...")
-        docs = [self._normalize_remote_doc(doc) for doc in await gather_all_docs(
-            self._tg_client, self._chat_id
-        )]
+        docs = [self._normalize_remote_doc(doc) for doc in await self._gather_all_docs()]
         self._add_remote_docs(docs)
 
         bot_expired = sum(
@@ -393,25 +459,31 @@ class TelegramFS(pyfuse3.Operations):
             except Exception as e:
                 log.exception("Periodic sync task error: %s", e)
 
-    def _remote_doc_from_message(self, msg):
-        return remote_file_from_message(msg)
-
-    def _remote_entry_from_message(self, msg):
-        return remote_entry_from_message(msg)
-
     async def _fetch_remote_doc_by_msg_id(self, msg_id: int):
         msg = await self._retry_flood_wait(
             f"fetch known msg_id={msg_id}",
-            lambda: self._tg_client.get_messages(self._chat_id, msg_id),
+            lambda: self._tg_client.get_messages(self._chat_id, ids=msg_id),
         )
-        return self._remote_entry_from_message(msg)
+        if not msg or not msg.media or not hasattr(msg, 'document'):
+            return None
+            
+        file_name = next(
+            (attr.file_name for attr in msg.document.attributes if hasattr(attr, 'file_name')), 
+            f"audio_{msg.id}.mp3"
+        )
+        metadata = None
+        if msg.message:
+            try:
+                metadata = json.loads(msg.message)
+            except ValueError:
+                pass
+                
+        return (msg.id, str(msg.document.id), file_name.encode("utf-8"), msg.document.size, int(msg.date.timestamp()), metadata)
 
     async def _sync_channel_updates(self):
         """Add new docs & remove missing docs from local state."""
         log.debug("Syncing channel updates...")
-        docs = [self._normalize_remote_doc(doc) for doc in await gather_all_docs(
-            self._tg_client, self._chat_id
-        )]
+        docs = [self._normalize_remote_doc(doc) for doc in await self._gather_all_docs()]
         current_msgs = {}
         seen_msg_ids = set()
         for (m_id, f_id, fname_b, size, ts, metadata) in docs:
@@ -431,7 +503,7 @@ class TelegramFS(pyfuse3.Operations):
             doc = await self._fetch_remote_doc_by_msg_id(msg_id)
             if not doc:
                 continue
-            current_msgs[msg_id] = doc
+            current_msgs[msg_id] = doc[1:]
             new_msg_ids.add(msg_id)
             log.debug("Kept known msg_id=%s after direct sync check.", msg_id)
 
@@ -672,11 +744,11 @@ class TelegramFS(pyfuse3.Operations):
             sleep_for_wait=self._sleep_for_flood_wait,
         )
 
-    async def _copy_remote_to_path(self, file_id: str, path: str, label: str):
+    async def _copy_remote_to_path(self, msg_id: int, path: str, label: str):
         async def copy_remote_once():
-            with open(path, "wb") as out:
-                async for chunk in self._tg_client.stream_media(file_id):
-                    out.write(chunk)
+            msg = await self._tg_client.get_messages(self._chat_id, ids=msg_id)
+            if msg and msg.media:
+                await self._tg_client.download_media(msg.media, file=path)
 
         await self._retry_flood_wait(label, copy_remote_once)
 
@@ -689,9 +761,9 @@ class TelegramFS(pyfuse3.Operations):
         path = self._new_spool_path()
         info["spool_path"] = path
 
-        if copy_remote and info.get("file_id") and info.get("size", 0) > 0:
+        if copy_remote and info.get("message_id") and info.get("size", 0) > 0:
             log.debug("Spooling remote file inode=%s for modification.", inode)
-            await self._copy_remote_to_path(info["file_id"], path, f"spool inode={inode}")
+            await self._copy_remote_to_path(info["message_id"], path, f"spool inode={inode}")
         return path
 
     async def _truncate_inode(self, inode: int, size: int):
@@ -754,53 +826,58 @@ class TelegramFS(pyfuse3.Operations):
         if chunk:
             self._stream_buffer_put(key, chunk)
 
-    def _start_stream_chunk_task(self, file_id: str, chunk_index: int) -> asyncio.Task:
+    def _start_stream_chunk_task(self, msg_id: int, file_id: str, chunk_index: int) -> asyncio.Task:
         key = (file_id, chunk_index)
         task = self._stream_inflight.get(key)
         if task is not None:
             return task
 
-        task = asyncio.create_task(self._download_remote_chunk(file_id, chunk_index))
+        task = asyncio.create_task(self._download_remote_chunk(msg_id, file_id, chunk_index))
         self._stream_inflight[key] = task
         task.add_done_callback(lambda done_task: self._finish_stream_chunk_task(key, done_task))
         return task
 
-    async def _download_remote_chunk(self, file_id: str, chunk_index: int) -> bytes:
-        async def read_chunk_once():
-            if hasattr(self._tg_client, "storage"):
-                downloader = await self._downloader_for(file_id)
-                return await downloader.read_chunk(
-                    chunk_index,
-                    chunk_size=self._REMOTE_CHUNK_SIZE,
-                    timeout=self._REMOTE_READ_TIMEOUT,
-                    retries=self._REMOTE_READ_RETRIES,
-                )
+    async def _download_remote_chunk(self, msg_id: int, file_id: str, chunk_index: int) -> bytes:
+        chunk_file = os.path.join(self._cache_dir, f"{file_id}_chunk_{chunk_index}.bin")
+        if os.path.exists(chunk_file):
+            with open(chunk_file, 'rb') as f:
+                return f.read()
 
-            chunk = b""
-            async for part in self._tg_client.stream_media(
-                file_id,
-                limit=1,
-                offset=chunk_index,
+        async def read_chunk_once():
+            msg = await self._tg_client.get_messages(self._chat_id, ids=msg_id)
+            if not msg or not msg.media:
+                return b""
+
+            offset = chunk_index * self._REMOTE_CHUNK_SIZE
+            data = bytearray()
+            async for chunk in self._tg_client.iter_download(
+                msg.media,
+                offset=offset,
+                limit=self._REMOTE_CHUNK_SIZE
             ):
-                chunk = part
-                break
-            return chunk
+                data.extend(chunk)
+
+            chunk_data = bytes(data)
+            if chunk_data:
+                with open(chunk_file, 'wb') as f:
+                    f.write(chunk_data)
+            return chunk_data
 
         return await self._retry_flood_wait(
-            f"read file_id={file_id} chunk={chunk_index}",
+            f"read msg_id={msg_id} chunk={chunk_index}",
             read_chunk_once,
         )
 
-    async def _read_remote_chunk(self, file_id: str, chunk_index: int) -> bytes:
+    async def _read_remote_chunk(self, msg_id: int, file_id: str, chunk_index: int) -> bytes:
         key = (file_id, chunk_index)
         cached = self._stream_buffer_get(key)
         if cached is not None:
             return cached
 
-        task = self._start_stream_chunk_task(file_id, chunk_index)
+        task = self._start_stream_chunk_task(msg_id, file_id, chunk_index)
         return await asyncio.shield(task)
 
-    def _schedule_prefetch(self, file_id: str, start_chunk: int, file_size: int):
+    def _schedule_prefetch(self, msg_id: int, file_id: str, start_chunk: int, file_size: int):
         if start_chunk < 0 or start_chunk * self._REMOTE_CHUNK_SIZE >= file_size:
             return
 
@@ -815,7 +892,7 @@ class TelegramFS(pyfuse3.Operations):
                 return
             active.cancel()
 
-        task = asyncio.create_task(self._prefetch_worker(file_id, start_chunk, end_chunk))
+        task = asyncio.create_task(self._prefetch_worker(msg_id, file_id, start_chunk, end_chunk))
         self._prefetch_tasks[file_id] = task
         self._prefetch_ranges[file_id] = (start_chunk, end_chunk)
 
@@ -829,12 +906,12 @@ class TelegramFS(pyfuse3.Operations):
             return
         active.cancel()
 
-    async def _prefetch_worker(self, file_id: str, start_chunk: int, end_chunk: int):
+    async def _prefetch_worker(self, msg_id: int, file_id: str, start_chunk: int, end_chunk: int):
         try:
             for chunk_index in range(start_chunk, end_chunk + 1):
                 if (file_id, chunk_index) in self._stream_buffer:
                     continue
-                await self._read_remote_chunk(file_id, chunk_index)
+                await self._read_remote_chunk(msg_id, file_id, chunk_index)
                 await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
@@ -852,24 +929,11 @@ class TelegramFS(pyfuse3.Operations):
                 self._prefetch_tasks.pop(file_id, None)
                 self._prefetch_ranges.pop(file_id, None)
 
-    async def _downloader_for(self, file_id: str) -> RawDocumentDownloader:
-        downloader = self._downloaders.get(file_id)
-        if downloader is not None:
-            self._downloaders.move_to_end(file_id)
-            return downloader
-
-        downloader = RawDocumentDownloader(self._tg_client, file_id)
-        self._downloaders[file_id] = downloader
-        self._downloaders.move_to_end(file_id)
-        while len(self._downloaders) > self._downloaders_limit:
-            _, old = self._downloaders.popitem(last=False)
-            await old.close()
-        return downloader
-
     async def _read_remote_range(self, info: dict, offset: int, size: int) -> bytes:
         file_id = info.get("file_id")
+        msg_id = info.get("message_id")
         file_size = info.get("size", 0)
-        if not file_id or size <= 0 or offset >= file_size:
+        if not file_id or not msg_id or size <= 0 or offset >= file_size:
             return b""
 
         end_offset = min(offset + size, file_size)
@@ -881,7 +945,7 @@ class TelegramFS(pyfuse3.Operations):
         async def read_once() -> bytes:
             pieces: list[bytes] = []
             for chunk_index in range(start_chunk, end_chunk + 1):
-                chunk = await self._read_remote_chunk(file_id, chunk_index)
+                chunk = await self._read_remote_chunk(msg_id, file_id, chunk_index)
                 chunk_start = chunk_index * self._REMOTE_CHUNK_SIZE
                 chunk_end = chunk_start + len(chunk)
                 take_start = max(offset, chunk_start)
@@ -910,7 +974,7 @@ class TelegramFS(pyfuse3.Operations):
                 )
             else:
                 if len(data) == expected_size:
-                    self._schedule_prefetch(file_id, end_chunk + 1, file_size)
+                    self._schedule_prefetch(msg_id, file_id, end_chunk + 1, file_size)
                     return data
                 last_error = None
                 self._drop_stream_buffer_range(file_id, start_chunk, end_chunk)
@@ -939,7 +1003,7 @@ class TelegramFS(pyfuse3.Operations):
     async def _delete_remote_message_remote_only(self, msg_id: int):
         await self._retry_flood_wait(
             f"delete msg_id={msg_id}",
-            lambda: self._tg_client.delete_messages(self._chat_id, msg_id),
+            lambda: self._tg_client.delete_messages(self._chat_id, [msg_id]),
         )
 
     async def _delete_remote_message(self, msg_id: int):
@@ -1028,30 +1092,19 @@ class TelegramFS(pyfuse3.Operations):
             caption = build_directory_caption(directory_id, parent_id, name)
 
             async def send_marker_once():
-                return await send_document_from_path(
-                    self._tg_client,
+                return await self._tg_client.send_file(
                     self._chat_id,
                     marker_path,
-                    DIRECTORY_MARKER_NAME,
-                    1,
                     caption=caption,
+                    force_document=True,
+                    reply_to=None
                 )
 
             msg = await self._retry_flood_wait(
                 f"upload directory marker id={directory_id}",
                 send_marker_once,
             )
-            remote_entry = self._remote_entry_from_message(msg)
-            metadata = remote_entry[4] if remote_entry else None
-            if (
-                not msg
-                or not remote_entry
-                or not metadata
-                or metadata.get("kind") != "directory"
-                or metadata.get("directory_id") != directory_id
-            ):
-                raise FUSEError(errno.EIO)
-            return msg, remote_entry[0]
+            return msg, str(msg.document.id)
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(marker_path)
@@ -1070,31 +1123,19 @@ class TelegramFS(pyfuse3.Operations):
             caption = build_symlink_caption(parent_id, name, target)
 
             async def send_marker_once():
-                return await send_document_from_path(
-                    self._tg_client,
+                return await self._tg_client.send_file(
                     self._chat_id,
                     marker_path,
-                    SYMLINK_MARKER_NAME,
-                    1,
                     caption=caption,
+                    force_document=True,
+                    reply_to=None
                 )
 
             msg = await self._retry_flood_wait(
                 f"upload symlink marker name={name!r}",
                 send_marker_once,
             )
-            remote_entry = self._remote_entry_from_message(msg)
-            metadata = remote_entry[4] if remote_entry else None
-            if (
-                not msg
-                or not remote_entry
-                or not metadata
-                or metadata.get("kind") != "symlink"
-                or metadata.get("name") != name
-                or metadata.get("target") != target
-            ):
-                raise FUSEError(errno.EIO)
-            return msg, remote_entry[0]
+            return msg, str(msg.document.id)
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(marker_path)
@@ -1187,7 +1228,6 @@ class TelegramFS(pyfuse3.Operations):
             pending_delete = set(info.get("pending_delete_message_ids") or set())
             change_id = info.get("change_id", 0)
             file_name = self._file_name_text(info)
-            source_file_id = info.get("file_id") if not path else None
             original_message_id = info.get("message_id")
             delete_after_upload = set(pending_delete)
             if original_message_id:
@@ -1196,7 +1236,7 @@ class TelegramFS(pyfuse3.Operations):
             if size > 0 and path:
                 snapshot_path = self._new_spool_path()
                 shutil.copyfile(path, snapshot_path)
-            elif size > 0 and source_file_id:
+            elif size > 0 and original_message_id:
                 snapshot_path = self._new_spool_path()
             elif size > 0:
                 raise FUSEError(errno.EIO)
@@ -1234,22 +1274,20 @@ class TelegramFS(pyfuse3.Operations):
             return
 
         try:
-            if source_file_id:
+            if original_message_id:
                 await self._copy_remote_to_path(
-                    source_file_id,
+                    original_message_id,
                     snapshot_path,
                     f"snapshot inode={inode}",
                 )
 
             try:
                 async def send_document_once():
-                    return await send_document_from_path(
-                        self._tg_client,
+                    return await self._tg_client.send_file(
                         self._chat_id,
                         snapshot_path,
-                        file_name,
-                        size,
                         caption=self._file_caption_for_parent(info["parent_inode"]),
+                        force_document=True
                     )
 
                 msg = await self._retry_flood_wait(
@@ -1265,12 +1303,11 @@ class TelegramFS(pyfuse3.Operations):
                         self._mark_delete_forbidden(info)
                 raise FUSEError(errno.EIO) from exc
 
-            remote_file = self._remote_doc_from_message(msg)
-            if not msg or not remote_file:
+            if not msg or not msg.document:
                 raise FUSEError(errno.EIO)
 
             new_msg_id = msg.id
-            new_file_id = remote_file[0]
+            new_file_id = str(msg.document.id)
 
             async with self._lock_for(inode):
                 info = self._files.get(inode)

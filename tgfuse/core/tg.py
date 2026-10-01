@@ -1,14 +1,34 @@
 import sys, pyfuse3
-from pyrogram.client import Client
+from telethon import TelegramClient, events
+from telethon.tl.types import Channel
 
 from tgfuse.core.fuse import TelegramFS
 from tgfuse.core.fuse import fuse_runner
 
-from tgfuse.funcs.channel import test_write_permission, is_channel
-
 from tgfuse.config.config import Config
 from tgfuse.config import logging_config
 log = logging_config.setup_logging(__name__)
+
+async def is_channel(app: TelegramClient, chat_id):
+    try:
+        entity = await app.get_entity(chat_id)
+        return isinstance(entity, Channel) and getattr(entity, 'broadcast', False)
+    except Exception as e:
+        log.error(f"Error checking channel: {e}")
+        return False
+
+async def test_write_permission(app: TelegramClient, chat_id):
+    try:
+        entity = await app.get_entity(chat_id)
+        if isinstance(entity, Channel):
+            if getattr(entity, 'creator', False):
+                return True
+            admin_rights = getattr(entity, 'admin_rights', None)
+            if admin_rights and getattr(admin_rights, 'post_messages', False):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 async def init():
@@ -35,7 +55,10 @@ async def init():
         bot_token = None
         session_name = "tgfs_user_session"
 
-    async with Client(session_name, api_id=api_id, api_hash=api_hash, bot_token=bot_token) as app:
+    app = TelegramClient(session_name, api_id=api_id, api_hash=api_hash)
+    await app.start(bot_token=bot_token)
+
+    async with app:
         # Check channel
         if not await is_channel(app, chat_id):
             log.error("This chat is not a channel")
@@ -53,6 +76,14 @@ async def init():
             bot_mode=bool(Config.tg_token),
         )
         await fs.init_fs()
+        
+        @app.on(events.NewMessage(chats=chat_id))
+        async def on_new_message(event):
+            doc = fs.parse_message_to_doc(event.message)
+            if doc:
+                normalized_doc = fs._normalize_remote_doc(doc)
+                fs._add_remote_docs([normalized_doc])
+                log.info(f"Instantly added new file: {event.message.id}")        
 
         fuse_opts = set(pyfuse3.default_options)
         fuse_opts.add("default_permissions")
