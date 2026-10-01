@@ -8,6 +8,7 @@ import tempfile
 import time
 import uuid
 import json
+import pickle
 from collections import OrderedDict
 from typing import Sequence, Tuple
 
@@ -94,12 +95,23 @@ class TelegramFS(pyfuse3.Operations):
 
     async def _gather_all_docs(self):
         docs = []
+        cache_file = f"tgfuse_docs_{self._chat_id}.pkl"
+        
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "rb") as f:
+                    docs = pickle.load(f)
+                log.info("Loaded %s files from local cache.", len(docs))
+            except Exception as e:
+                log.warning("Cache load failed, starting fresh: %s", e)
+                docs = []
+
+        current_id = max([d[0] for d in docs]) + 1 if docs else 1
+        
         batch_size = 200
-        current_id = 1
         max_empty_batches = 5 
         empty_batches = 0
-
-        # Define allowed extensions (use lowercase)
+        new_files_found = 0
         allowed_extensions = ['.m4a', '.flac']
 
         while True:
@@ -119,7 +131,6 @@ class TelegramFS(pyfuse3.Operations):
                 if msg.document:
                     file_name = msg.file.name if msg.file and msg.file.name else f"unnamed_{msg.id}"
                 
-                    # Check if the file extension is in our allowed list
                     ext = os.path.splitext(file_name)[1].lower()
                     if ext not in allowed_extensions:
                         continue
@@ -140,9 +151,18 @@ class TelegramFS(pyfuse3.Operations):
                         ts, 
                         metadata
                     ))
+                    new_files_found += 1
 
             current_id += batch_size
             await asyncio.sleep(1.0) 
+
+        if new_files_found > 0:
+            try:
+                with open(cache_file, "wb") as f:
+                    pickle.dump(docs, f)
+                log.info("Saved %s new files to cache (Total: %s).", new_files_found, len(docs))
+            except Exception as e:
+                log.error("Failed to save cache: %s", e)
 
         return docs
     
