@@ -49,11 +49,11 @@ async def init():
     if Config.tg_token:
         log.info("Start as common bot.")
         bot_token = Config.tg_token
-        session_name = "tgfs_bot_session"
+        session_name = f"{Config.session_name}_bot"
     else:
         log.info("Start as user bot.")
         bot_token = None
-        session_name = "tgfs_user_session"
+        session_name = f"{Config.session_name}_bot"
 
     app = TelegramClient(session_name, api_id=api_id, api_hash=api_hash)
     await app.start(bot_token=bot_token)

@@ -50,7 +50,7 @@ async def main():
         fuse_meta = build_file_caption(args.parent)
         final_caption = f"{fuse_meta}\n\n{args.caption}" if args.caption else fuse_meta
 
-    session_name = "tgfs_bot_session" if Config.tg_token else "tgfs_user_session"
+    session_name = f"{Config.session_name}_bot" if Config.tg_token else f"{Config.session_name}_user"
     client = TelegramClient(session_name, int(Config.tg_id), Config.tg_hash)
     
     await client.start(bot_token=Config.tg_token if Config.tg_token else None)

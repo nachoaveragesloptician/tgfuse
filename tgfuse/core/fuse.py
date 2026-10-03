@@ -17,6 +17,7 @@ import pyfuse3.asyncio
 from telethon.errors import RPCError
 from pyfuse3 import EntryAttributes, FileInfo, FUSEError, ROOT_INODE
 
+from tgfuse.config.config import Config
 from tgfuse.config import logging_config
 from tgfuse.funcs.floodwait import sleep_for_flood_wait, retry_flood_wait
 from tgfuse.funcs.media import (
@@ -96,7 +97,7 @@ class TelegramFS(pyfuse3.Operations):
 
     async def _gather_all_docs(self):
         docs = []
-        cache_file = f"tgfuse_docs_{self._chat_id}.pkl"
+        cache_file = os.path.join(self._cache_dir, f"tgfuse_docs_{self._chat_id}.pkl")
         
         if os.path.exists(cache_file):
             try:
@@ -107,13 +108,20 @@ class TelegramFS(pyfuse3.Operations):
                 log.warning("Cache load failed, starting fresh: %s", e)
                 docs = []
 
-        current_id = max([d[0] for d in docs]) + 1 if docs else 1
+        if docs:
+            current_id = max([d[0] for d in docs]) + 1
+        else:
+            if not Config.sync_on_mount:
+                log.info("SYNC_ON_MOUNT=False and no cache found. Skipping channel history...")
+                latest = await self._tg_client.get_messages(self._chat_id, limit=1)
+                current_id = latest[0].id if latest else 1
+            else:
+                current_id = 1
         
         batch_size = 200
         max_empty_batches = 25
         empty_batches = 0
         new_files_found = 0
-        allowed_extensions = ['.m4a', '.flac']
 
         while True:
             ids_to_fetch = list(range(current_id, current_id + batch_size))
@@ -132,9 +140,10 @@ class TelegramFS(pyfuse3.Operations):
                 if msg.document:
                     file_name = msg.file.name if msg.file and msg.file.name else f"unnamed_{msg.id}"
                 
-                    ext = os.path.splitext(file_name)[1].lower()
-                    if ext not in allowed_extensions:
-                        continue
+                    if Config.extensions:
+                        ext = os.path.splitext(file_name)[1].lower().strip('.')
+                        if ext not in Config.extensions:
+                            continue
                 
                     size = msg.document.size
                     ts = int(msg.date.timestamp()) if msg.date else 0
@@ -168,15 +177,15 @@ class TelegramFS(pyfuse3.Operations):
         return docs
     
     def parse_message_to_doc(self, msg):
-        allowed_extensions = ['.m4a', '.flac']
-        
         if not msg.document:
             return None
             
         file_name = msg.file.name if msg.file and msg.file.name else f"unnamed_{msg.id}"
-        ext = os.path.splitext(file_name)[1].lower()
-        if ext not in allowed_extensions:
-            return None
+        
+        if Config.extensions:
+            ext = os.path.splitext(file_name)[1].lower().strip('.')
+            if ext not in Config.extensions:
+                return None
             
         size = msg.document.size
         ts = int(msg.date.timestamp()) if msg.date else 0
@@ -486,8 +495,14 @@ class TelegramFS(pyfuse3.Operations):
             
         file_name = next(
             (attr.file_name for attr in msg.document.attributes if hasattr(attr, 'file_name')), 
-            f"audio_{msg.id}.mp3"
+            f"unnamed_{msg.id}"
         )
+        
+        if Config.extensions:
+            ext = os.path.splitext(file_name)[1].lower().strip('.')
+            if ext not in Config.extensions:
+                return None
+                
         metadata = None
         if msg.message:
             try:
