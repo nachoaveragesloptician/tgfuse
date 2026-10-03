@@ -14,7 +14,7 @@ from typing import Sequence, Tuple
 from telethon.tl.types import DocumentAttributeFilename
 import pyfuse3
 import pyfuse3.asyncio
-from telethon.errors import RPCError
+from telethon.errors import RPCError, BotMethodInvalidError
 from pyfuse3 import EntryAttributes, FileInfo, FUSEError, ROOT_INODE
 
 from tgfuse.config.config import Config
@@ -37,9 +37,9 @@ BOT_DELETE_MAX_AGE = 48 * 60 * 60
 UNMANAGED_DIRECTORY_NAME = b"unmanaged"
 
 class TelegramFS(pyfuse3.Operations):
-    _REMOTE_CHUNK_SIZE = 1024 * 1024
-    _STREAM_BUFFER_LIMIT = 64 * 1024 * 1024
-    _PREFETCH_CHUNKS = 4
+    _REMOTE_CHUNK_SIZE = 4 * 1024 * 1024
+    _STREAM_BUFFER_LIMIT = 128 * 1024 * 1024
+    _PREFETCH_CHUNKS = 8
     _REMOTE_READ_TIMEOUT = 30
     _REMOTE_READ_RETRIES = 3
 
@@ -94,6 +94,9 @@ class TelegramFS(pyfuse3.Operations):
         self._prefetch_tasks: dict[str, asyncio.Task] = {}
         self._prefetch_ranges: dict[str, tuple[int, int]] = {}
         self._media_cache: dict[int, object] = {}
+        
+        from tgfuse.core.fast_telethon import MTProtoPool
+        self.mtproto_pool = MTProtoPool(client, connections=Config.tg_upload_workers)
 
     async def _gather_all_docs(self):
         docs = []
@@ -113,8 +116,12 @@ class TelegramFS(pyfuse3.Operations):
         else:
             if not Config.sync_on_mount:
                 log.info("SYNC_ON_MOUNT=False and no cache found. Skipping channel history...")
-                latest = await self._tg_client.get_messages(self._chat_id, limit=1)
-                current_id = latest[0].id if latest else 1
+                try:
+                    latest = await self._tg_client.get_messages(self._chat_id, limit=1)
+                    current_id = latest[0].id if latest else 1
+                except BotMethodInvalidError:
+                    log.warning("Bot accounts cannot fetch history. Defaulting start ID to 1.")
+                    current_id = 1
             else:
                 current_id = 1
         
@@ -246,6 +253,7 @@ class TelegramFS(pyfuse3.Operations):
         self._stream_buffer.clear()
         self._stream_buffer_bytes = 0
         self._media_cache.clear()
+        await self.mtproto_pool.disconnect()
 
         for inode in list(self._files):
             info = self._files.get(inode)
@@ -731,6 +739,7 @@ class TelegramFS(pyfuse3.Operations):
             or name.endswith(b".swp")
             or name.endswith(b".swx")
             or name == b"4913"
+            or (len(name) == 8 and name.startswith(b"zi") and name[2:].isalnum())
         )
 
     def _lock_for(self, inode: int) -> asyncio.Lock:
@@ -880,17 +889,7 @@ class TelegramFS(pyfuse3.Operations):
                 self._media_cache[msg_id] = media
 
             offset = chunk_index * self._REMOTE_CHUNK_SIZE
-            data = bytearray()
-            async for chunk in self._tg_client.iter_download(
-                media,
-                offset=offset,
-                request_size=min(self._REMOTE_CHUNK_SIZE, 512 * 1024)
-            ):
-                data.extend(chunk)
-                if len(data) >= self._REMOTE_CHUNK_SIZE:
-                    break
-
-            return bytes(data[:self._REMOTE_CHUNK_SIZE])
+            return await self.mtproto_pool.download_chunk(media.document, offset, self._REMOTE_CHUNK_SIZE)
 
         return await self._retry_flood_wait(
             f"read msg_id={msg_id} chunk={chunk_index}",
@@ -1313,7 +1312,6 @@ class TelegramFS(pyfuse3.Operations):
                     f"snapshot inode={inode}",
                 )
             
-            
             custom_caption = ""
             caption_key = (info["parent_inode"], info["file_name"] + b".caption")
             if caption_key in self._name_to_inode:
@@ -1329,13 +1327,14 @@ class TelegramFS(pyfuse3.Operations):
             final_caption = self._file_caption_for_parent(info["parent_inode"]) + custom_caption
             try:
                 async def send_document_once():
+                    uploaded_file = await self.mtproto_pool.upload_file(snapshot_path, file_name)
                     return await self._tg_client.send_file(
                         self._chat_id,
-                        snapshot_path,
+                        uploaded_file,
                         caption=final_caption,
                         force_document=True,
                         attributes=[DocumentAttributeFilename(file_name=file_name)]
-                )
+                    )
 
                 msg = await self._retry_flood_wait(
                     f"upload inode={inode} name={file_name}",
