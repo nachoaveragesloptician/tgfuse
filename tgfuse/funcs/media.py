@@ -84,7 +84,8 @@ def parse_tgfs_caption(caption) -> dict | None:
     if not isinstance(caption, str) or not caption.startswith(TGFS_CAPTION_PREFIX):
         return None
     try:
-        value = json.loads(caption[len(TGFS_CAPTION_PREFIX):])
+        json_str = caption[len(TGFS_CAPTION_PREFIX):].split('\n', 1)[0]
+        value = json.loads(json_str)
     except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(value, dict) or not _valid_directory_id(value.get("parent")):

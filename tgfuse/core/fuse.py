@@ -11,7 +11,7 @@ import json
 import pickle
 from collections import OrderedDict
 from typing import Sequence, Tuple
-
+from telethon.tl.types import DocumentAttributeFilename
 import pyfuse3
 import pyfuse3.asyncio
 from telethon.errors import RPCError
@@ -1297,15 +1297,30 @@ class TelegramFS(pyfuse3.Operations):
                     snapshot_path,
                     f"snapshot inode={inode}",
                 )
+            
+            
+            custom_caption = ""
+            caption_key = (info["parent_inode"], info["file_name"] + b".caption")
+            if caption_key in self._name_to_inode:
+                cap_inode = self._name_to_inode[caption_key]
+                cap_info = self._files.get(cap_inode)
+                if cap_info and cap_info.get("spool_path"):
+                    try:
+                        with open(cap_info["spool_path"], "r", encoding="utf-8") as f:
+                            custom_caption = "\n\n" + f.read().strip()
+                    except Exception:
+                        pass
 
+            final_caption = self._file_caption_for_parent(info["parent_inode"]) + custom_caption
             try:
                 async def send_document_once():
                     return await self._tg_client.send_file(
                         self._chat_id,
                         snapshot_path,
-                        caption=self._file_caption_for_parent(info["parent_inode"]),
-                        force_document=True
-                    )
+                        caption=final_caption,
+                        force_document=True,
+                        attributes=[DocumentAttributeFilename(file_name=file_name)]
+                )
 
                 msg = await self._retry_flood_wait(
                     f"upload inode={inode} name={file_name}",
